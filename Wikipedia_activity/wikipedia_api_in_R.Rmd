@@ -1,0 +1,423 @@
+---
+title: 'Wikipedia as Data: Page Views and Edit Activity in R'
+author: ""
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setting Up
+
+```{r functions}
+source("R//functions//functions.R")
+```
+
+```{r libraries}
+package_check(c("jsonlite", "ggplot2", "dplyr", "tidylog",
+                "sf", "tmap", "rnaturalearth", "rnaturalearthdata"))
+```
+
+```{r cache_note, echo=FALSE}
+# Each API chunk below calls the live Wikimedia API first.
+# If the API call fails (e.g. due to a rate limit), it automatically
+# falls back to pre-fetched data in data/if_needed/ — so the rest of
+# the worksheet will still run even if the API is unavailable.
+.fallback <- function(path) {
+  if (file.exists(path)) {
+    message("  API unavailable — loading pre-fetched data from ", path)
+    readRDS(path)
+  } else {
+    stop("API call failed and no pre-fetched data found at: ", path)
+  }
+}
+```
+
+# The Wikipedia API
+
+Unlike the Google Trends interface we have worked with elsewhere, Wikipedia provides a **fully official, documented, and free REST API** — no scraping, no session cookies, no rate-limiting for reasonable use. But, as always, this doesn't mean the code you write today won't break unexpectedly.
+
+The API is maintained by the Wikimedia Foundation and documented at [wikimedia.org/api/rest_v1](https://wikimedia.org/api/rest_v1/). It provides access to:
+
+- **Page view counts**: how many times a given article was viewed, per day
+- **Edit activity**: how many times a given article was edited, per day
+- **Top articles**: the most-viewed articles on a given Wikipedia edition
+- ...and much more
+
+We will access both page views and edit data via custom functions that call the API directly using `{jsonlite}`. The two functions — `get_article_views()` and `get_article_edits()` — are already loaded from `functions.R`, and both work the same way: they construct a URL, call the API, and return a tidy data frame. Reading their code is a good introduction to working with REST APIs in R.
+
+# Interpreting Wikipedia Data
+
+Before diving in, it is worth being clear about what these two metrics actually measure:
+
+**Page views** count the number of times an article page was loaded by a human user (bots are filtered out). A spike in page views typically indicates that something happened — a news event, a speech, a viral moment — that sent people to Wikipedia to find out more.
+
+**Edit counts** count the number of times the article text was changed. Wikipedia articles about ongoing events are edited in near real-time as events unfold — sometimes within minutes of breaking news. High edit activity can indicate:
+
+- New information being added as events develop
+- Controversy or disputed facts (leading to "edit wars")
+- Vandalism and its subsequent repair
+
+Both metrics are **raw counts**, not normalised like Google Trends data. If you want to compare across language editions of different sizes, you will need to normalise by total project activity — something we will do in Part 3.
+
+---
+
+# Part 1: Page Views — Trump Across the Globe
+
+The article "Donald Trump" is one of the most-viewed political articles across virtually all language editions of Wikipedia, and — critically for our purposes — the article title is the same in almost every language. This makes it unusually easy to compare interest across countries.
+
+## Time Series: English Wikipedia
+
+```{r trump_views_setup}
+# Set date range (API lags ~1 day, so end at yesterday):
+end_date   <- format(Sys.Date() - 1, "%Y%m%d")
+start_date <- format(Sys.Date() - 30, "%Y%m%d")
+
+# Define Wikipedia articles based on their URLs:
+trump_articles <- c("Donald_Trump",
+                    "Second_presidency_of_Donald_Trump",
+                    "Relationship_of_Donald_Trump_and_Jeffrey_Epstein")
+```
+
+```{r trump_views_fetch}
+# Fetch daily page views for each article on English Wikipedia:
+views_list <- lapply(trump_articles, function(article) {
+  tryCatch(
+    get_article_views(article = article, project = "en.wikipedia",
+                      start = start_date, end = end_date),
+    error = function(e) {
+      message("Could not fetch views for: ", article, " — ", e$message)
+      NULL
+    }
+  )
+})
+views_combined <- bind_rows(views_list)
+
+# If the API returned nothing, fall back to pre-fetched data:
+if (nrow(views_combined) == 0) {
+  views_combined <- .fallback("data/if_needed/wiki_views_combined.rds")
+}
+
+str(views_combined)
+```
+
+Note the data structure: one row per article per day, with a `views` column giving the raw count. Compare this to Google Trends — there is no 0–100 normalisation here. In this case, we asked for 30 days worth of views for three articles (defined in `trump_articles` above), for a total of 90 observations.
+
+```{r trump_views_plot}
+ggplot(views_combined, aes(x = as.Date(date), y = views, colour = article)) +
+  geom_line() +
+  labs(title = "English Wikipedia Page Views: Trump-Related Articles (Last 30 Days)",
+       x = "Date", y = "Page Views", colour = "Article") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Cross-National Map: Which Countries Are Reading About Trump?
+
+Wikipedia is published in hundreds of languages, each with its own reader community. By summing page views across language editions and mapping them to their primary country, we get a rough proxy for cross-national interest.
+
+This is an imperfect measure — English Wikipedia is read worldwide, not just in the US — but it is a useful approximation, and its limitations are themselves worth discussing.
+
+```{r cross_language_views}
+# Language editions to query, and their representative countries:
+lang_country <- data.frame(
+  language = c("en", "de", "fr", "es", "it", "pt", "ru", "zh", "ja",
+               "ar", "nl", "pl", "sv", "ko", "tr", "uk", "id", "vi"),
+  country  = c("United States of America", "Germany", "France", "Spain", "Italy",
+               "Brazil", "Russia", "China", "Japan", "Egypt", "Netherlands",
+               "Poland", "Sweden", "South Korea", "Turkey", "Ukraine",
+               "Indonesia", "Vietnam"),
+  stringsAsFactors = FALSE
+)
+
+# Fetch total views per language edition over the last 30 days:
+lang_views_list <- lapply(lang_country$language, function(lang) {
+  tryCatch({
+    result <- get_article_views(article = "Donald_Trump",
+                                project = paste0(lang, ".wikipedia"),
+                                start   = start_date,
+                                end     = end_date)
+    data.frame(language = lang, total_views = sum(result$views, na.rm = TRUE))
+  }, error = function(e) {
+    message("Could not fetch for language: ", lang)
+    data.frame(language = lang, total_views = NA_integer_)
+  })
+})
+lang_views_df <- bind_rows(lang_views_list)
+
+# If all language queries failed, fall back to pre-fetched data:
+if (all(is.na(lang_views_df$total_views))) {
+  lang_views_df <- .fallback("data/if_needed/wiki_lang_views_df.rds")
+}
+
+# Join to country lookup, then to shapefile:
+lang_views_df <- left_join(lang_views_df, lang_country, by = "language")
+country_shp   <- st_read("data/shapefiles/world-administrative-boundaries.shp", quiet = TRUE)
+map_views     <- left_join(country_shp, lang_views_df, by = c("name" = "country"))
+
+# Inspect the join:
+cat("Matched countries:", sum(!is.na(map_views$total_views)), "\n")
+```
+
+```{r views_map}
+tm_shape(map_views) +
+  tm_fill(col      = "total_views",
+          style    = "quantile",
+          n        = 5,
+          title    = "Total Page Views",
+          textNA   = "No data") +
+  tm_borders(col = "gray") +
+  tm_layout(main.title      = "Wikipedia Views of 'Donald Trump' by Language Edition (Last 30 Days)",
+            legend.position = c("left", "bottom"),
+            frame           = FALSE)
+```
+
+---
+
+# Part 2: Edit Activity — Wikipedia as a Real-Time Record
+
+If page views measure *reading*, edit counts measure *writing*. Every change made to a Wikipedia article is recorded — who made it, when, and what changed. For high-profile topics, this creates a rich time series of editorial activity that closely tracks real-world events.
+
+The "Donald Trump" article on English Wikipedia is one of the most-edited political articles in Wikipedia's history. Plotting daily edit counts reveals clear spikes around major events: court appearances, elections, executive orders, and controversies. This kind of analysis — linking edit surges to real-world moments — is an active area of research using Wikipedia as a data source.
+
+## Time Series: Daily Edits on English Wikipedia
+
+```{r trump_edits_time}
+trump_edits_en <- tryCatch(
+  get_article_edits(
+    article = "Donald_Trump",
+    project = "en.wikipedia",
+    start   = "2024-01-01",
+    end     = format(Sys.Date() - 1, "%Y-%m-%d")
+  ),
+  error = function(e) {
+    message("Could not fetch edit data: ", e$message)
+    .fallback("data/if_needed/wiki_trump_edits_en.rds")
+  }
+)
+
+if (!is.null(trump_edits_en)) str(trump_edits_en)
+```
+
+```{r trump_edits_plot}
+if (!is.null(trump_edits_en)) {
+  ggplot(trump_edits_en, aes(x = date, y = edits)) +
+    geom_col(fill = "steelblue") +
+    labs(title = "Daily Edits to 'Donald Trump' Article — English Wikipedia",
+         x = "Date", y = "Number of Edits") +
+    theme_minimal()
+}
+```
+
+Look for spikes. Can you match them to specific events? Cross-reference with a news timeline and see how quickly Wikipedia editing responds to breaking news.
+
+## Cross-National Comparison: Who Is Writing About Trump?
+
+The article title "Donald_Trump" is consistent across almost all language editions, making cross-language edit comparison straightforward. Which countries' Wikipedia communities are most actively editing about Trump — and does that match your expectations?
+
+```{r trump_edits_languages}
+trump_edits_list <- lapply(lang_country$language, function(lang) {
+  tryCatch(
+    get_article_edits(
+      article = "Donald_Trump",
+      project = paste0(lang, ".wikipedia"),
+      start   = "2024-01-01",
+      end     = format(Sys.Date() - 1, "%Y-%m-%d")
+    ) %>% mutate(language = lang),
+    error = function(e) {
+      message("Could not fetch edits for language '", lang, "': ", e$message)
+      NULL
+    }
+  )
+})
+trump_edits_df <- bind_rows(trump_edits_list)
+
+# If the API returned nothing, fall back to pre-fetched data:
+if (nrow(trump_edits_df) == 0) {
+  trump_edits_df <- .fallback("data/if_needed/wiki_trump_edits_df.rds")
+}
+```
+
+```{r trump_edits_multilang_plot}
+if (nrow(trump_edits_df) > 0) {
+  trump_edits_df %>%
+    group_by(language) %>%
+    summarise(total_edits = sum(edits, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(total_edits)) %>%
+    ggplot(aes(x = reorder(language, total_edits), y = total_edits)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = "Total Edits to 'Donald Trump' Article by Language Edition (Since Jan 2024)",
+         x = "Wikipedia Language", y = "Total Edits") +
+    theme_minimal()
+}
+```
+
+```{r trump_edits_map}
+if (nrow(trump_edits_df) > 0) {
+  lang_edits_totals <- trump_edits_df %>%
+    group_by(language) %>%
+    summarise(total_edits = sum(edits, na.rm = TRUE), .groups = "drop") %>%
+    left_join(lang_country, by = "language")
+
+  map_edits <- left_join(country_shp, lang_edits_totals, by = c("name" = "country"))
+
+  tm_shape(map_edits) +
+    tm_fill(col      = "total_edits",
+            style    = "quantile",
+            n        = 5,
+            title    = "Total Edits",
+            textNA   = "No data") +
+    tm_borders(col = "gray") +
+    tm_layout(main.title      = "Wikipedia Edit Activity on 'Donald Trump' Article by Language Edition",
+              legend.position = c("left", "bottom"),
+              frame           = FALSE)
+}
+```
+
+---
+
+# Part 3: Extension — Normalising the Data
+
+## The Problem with Raw Counts
+
+The maps in Parts 1 and 2 tell us how many times each language edition's readers viewed or editors changed the Trump article. But this conflates two things:
+
+1. **Relative interest in Trump** within a given Wikipedia community
+2. **The overall size of that Wikipedia edition**
+
+English Wikipedia is read by hundreds of millions of people worldwide; Vietnamese Wikipedia is much smaller. Even if Vietnamese readers were proportionally *more* interested in Trump, English Wikipedia would almost certainly show higher raw view counts. Raw counts tell us about absolute volume, not relative attention.
+
+**Normalising** divides each article's count by the total activity on that edition, giving us something closer to "what share of this edition's readers were looking at Trump?" This is a more meaningful cross-national comparison.
+
+## Fetching Total Project Views
+
+The `get_project_views()` function (loaded from `functions.R`) calls the Wikimedia aggregate pageviews endpoint — the project-level counterpart to `get_article_views()`. It returns total human pageviews for an entire Wikipedia edition per day. We sum this over the same 30-day window used above to get a denominator for normalisation.
+
+```{r load_project_views}
+project_views_list <- lapply(lang_country$language, function(lang) {
+  Sys.sleep(0.25)
+  tryCatch({
+    pv <- get_project_views(project = paste0(lang, ".wikipedia"),
+                            start   = start_date,
+                            end     = end_date)
+    data.frame(language = lang,
+               total_project_views = sum(pv$views, na.rm = TRUE))
+  }, error = function(e) {
+    message("Could not fetch project views for: ", lang, " — ", e$message)
+    data.frame(language = lang, total_project_views = NA_integer_)
+  })
+})
+project_views_df <- bind_rows(project_views_list)
+
+# If all queries failed, fall back to pre-fetched data:
+if (all(is.na(project_views_df$total_project_views))) {
+  project_views_df <- .fallback("data/if_needed/wiki_project_views_df.rds")
+}
+
+print(project_views_df)
+```
+
+Note the dramatic differences in edition size. English Wikipedia receives hundreds of millions of views per month; smaller language editions receive far fewer. Any cross-national comparison using raw counts is substantially driven by these size differences.
+
+## Normalising Page Views
+
+We express normalised views as **Trump article views per 1,000 total project views** — i.e., out of every 1,000 pages a reader viewed on that Wikipedia edition, how many were the Trump article?
+
+```{r normalise_views}
+# Join Trump article views with total project views, then normalise:
+norm_views_df <- lang_views_df %>%
+  left_join(project_views_df, by = "language") %>%
+  mutate(
+    views_per_1k = total_views / total_project_views * 1000
+  )
+
+# Show the comparison: raw vs normalised
+norm_views_df %>%
+  select(language, country, total_views, total_project_views, views_per_1k) %>%
+  arrange(desc(views_per_1k))
+```
+
+```{r normalised_views_map}
+map_norm_views <- left_join(country_shp, norm_views_df, by = c("name" = "country"))
+
+tm_shape(map_norm_views) +
+  tm_fill(col      = "views_per_1k",
+          style    = "quantile",
+          n        = 5,
+          title    = "Trump Views\nper 1,000 Project Views",
+          textNA   = "No data",
+          palette  = "YlOrRd") +
+  tm_borders(col = "gray60") +
+  tm_layout(
+    main.title      = "Normalised Wikipedia Views of 'Donald Trump'\n(per 1,000 Total Edition Views, Last 30 Days)",
+    main.title.size = 0.9,
+    legend.position = c("left", "bottom"),
+    frame           = FALSE
+  )
+```
+
+Compare this map to the raw-count map in Part 1. What changes? Does the US look different relative to other countries? Are there any surprises — countries with high *relative* interest that were hidden by their edition's small size?
+
+## Normalising Edit Counts
+
+We apply the same logic to edit counts. Here we normalise edits by total project views (not project edits) — this uses total readership as a proxy for edition size, which is a reasonable denominator when project-wide edit data is not readily available.
+
+```{r normalise_edits}
+if (nrow(trump_edits_df) > 0) {
+  lang_edits_totals <- trump_edits_df %>%
+    group_by(language) %>%
+    summarise(total_edits = sum(edits, na.rm = TRUE), .groups = "drop") %>%
+    left_join(lang_country, by = "language")
+
+  norm_edits_df <- lang_edits_totals %>%
+    left_join(project_views_df, by = "language") %>%
+    mutate(
+      edits_per_million_views = total_edits / total_project_views * 1e6
+    )
+
+  norm_edits_df %>%
+    select(language, country, total_edits, total_project_views, edits_per_million_views) %>%
+    arrange(desc(edits_per_million_views))
+}
+```
+
+```{r normalised_edits_map}
+if (exists("norm_edits_df") && nrow(norm_edits_df) > 0) {
+  map_norm_edits <- left_join(country_shp, norm_edits_df, by = c("name" = "country"))
+
+  tm_shape(map_norm_edits) +
+    tm_fill(col      = "edits_per_million_views",
+            style    = "quantile",
+            n        = 5,
+            title    = "Trump Edits per\nMillion Project Views",
+            textNA   = "No data",
+            palette  = "PuBuGn") +
+    tm_borders(col = "gray60") +
+    tm_layout(
+      main.title      = "Normalised Wikipedia Edit Activity on 'Donald Trump'\n(per Million Total Edition Views, Since Jan 2024)",
+      main.title.size = 0.9,
+      legend.position = c("left", "bottom"),
+      frame           = FALSE
+    )
+}
+```
+
+
+Note a **persistent limitation**: even after normalisation, language does not map neatly to country. French Wikipedia is read in France, Belgium, Switzerland, Canada, and across Francophone Africa. 
+
+---
+
+# Independent Task
+
+Pick **one or two Wikipedia articles** on a topic or event that interests you and use `get_article_views()` to plot their daily page view time series.
+
+Some starting points:
+
+- **A current news story** — find the Wikipedia article for a recent event and look for spikes. Do views surge the moment news breaks, or with a delay? How quickly do they fall off?
+- **Two sides of a story** — compare views for two related articles (e.g., a policy and its main opponent, or a conflict and its political resolution). Do they move together, or does one lag the other?
+- **A recurring event** — something with a predictable schedule (an election, a sporting event, a TV series). Does the pattern in the data match what you would expect?
+
+For any article on English Wikipedia, the URL gives you the article name directly: `https://en.wikipedia.org/wiki/ARTICLE_NAME`. Pass that name to `get_article_views()`, replacing spaces with underscores.
